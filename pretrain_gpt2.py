@@ -32,7 +32,7 @@ from configure_data import configure_data
 from fp16 import FP16_Module
 from fp16 import FP16_Optimizer
 from learning_rates import AnnealingLR
-from model import GPT2Model
+from model import GPT2Model, GPT2Model_C
 from model import gpt2_get_params_for_weight_decay_optimization
 
 if USE_TORCH_DDP:
@@ -96,6 +96,48 @@ def get_model(args, model_cls):
 
     return model
 
+def get_model_C(args, model_cls):
+    """Build the model."""
+
+    print_rank_0('building GPT2 model ...')
+    model = model_cls(num_layers=args.num_layers,
+                      vocab_size=args.vocab_size,
+                      hidden_size=args.hidden_size,
+                      num_labels=args.num_labels,
+                      num_attention_heads=args.num_attention_heads,
+                      embedding_dropout_prob=args.hidden_dropout,
+                      attention_dropout_prob=args.attention_dropout,
+                      output_dropout_prob=args.hidden_dropout,
+                      max_sequence_length=args.max_position_embeddings,
+                      checkpoint_activations=args.checkpoint_activations,
+                      checkpoint_num_layers=args.checkpoint_num_layers,
+                      parallel_output=True)
+
+    if mpu.get_data_parallel_rank() == 0:
+        print(' > number of parameters on model parallel rank {}: {}'.format(
+            mpu.get_model_parallel_rank(),
+            sum([p.nelement() for p in model.parameters()])), flush=True)
+
+    # To prevent OOM for model sizes that cannot fit in GPU memory in full precision
+    if args.deepspeed and args.fp16:
+        model.half()
+
+    # GPU allocation.
+    model.cuda(torch.cuda.current_device())
+
+    # Fp16 conversion.
+    if args.fp16:
+        model = FP16_Module(model)
+
+    # Wrap model for distributed training.
+    if USE_TORCH_DDP:
+        i = torch.cuda.current_device()
+        model = DDP(model, device_ids=[i], output_device=i,
+                    process_group=mpu.get_data_parallel_group())
+    else:
+        model = DDP(model)
+
+    return model
 
 def get_optimizer(model, args):
     """Set up the optimizer."""
@@ -167,6 +209,33 @@ def setup_model_and_optimizer(args, model_cls=GPT2Model):
     """Setup model and optimizer."""
 
     model = get_model(args, model_cls)
+    optimizer = get_optimizer(model, args)
+    lr_scheduler = get_learning_rate_scheduler(optimizer, args)
+
+    if args.deepspeed:
+        print_rank_0("DeepSpeed is enabled.")
+
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            args=args,
+            lr_scheduler=lr_scheduler,
+            mpu=mpu,
+            dist_init_required=False
+        )
+
+    if args.load is not None:
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler, args)
+    else:
+        args.iteration = 0
+
+    return model, optimizer, lr_scheduler
+
+
+def setup_model_and_optimizer_C(args, model_cls=GPT2Model_C):
+    """Setup model and optimizer."""
+
+    model = get_model_C(args, model_cls)
     optimizer = get_optimizer(model, args)
     lr_scheduler = get_learning_rate_scheduler(optimizer, args)
 
